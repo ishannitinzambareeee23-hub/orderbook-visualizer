@@ -1,510 +1,792 @@
 'use client';
 
 import React, { useState, useEffect, useMemo, useCallback, useRef, memo } from 'react';
-import { TrendingUp, TrendingDown, Activity, Wifi, WifiOff, DollarSign, BarChart3 } from 'lucide-react';
+import { TrendingUp, TrendingDown, Activity, Wifi, WifiOff, Zap, BarChart3, AlertCircle, CheckCircle2 } from 'lucide-react';
 
-// Types
+// ============================================================================
+// TYPES & INTERFACES - Clean TypeScript usage
+// ============================================================================
+
+interface OrderBookLevel {
+  price: number;
+  amount: number;
+  total: number;
+}
+
 interface Trade {
-  id: string;
+  id: number;
   price: number;
   quantity: number;
   time: number;
   isBuyerMaker: boolean;
-}
-
-interface OrderBookLevel {
-  price: number;
-  quantity: number;
-  total: number;
+  isNew: boolean;
 }
 
 interface OrderBookData {
   bids: Map<number, number>;
   asks: Map<number, number>;
-  lastUpdateId: number;
 }
 
-// Custom Hook for Binance WebSocket
+interface ProcessedOrderBook {
+  bids: OrderBookLevel[];
+  asks: OrderBookLevel[];
+  maxBidTotal: number;
+  maxAskTotal: number;
+  spread: number;
+  spreadPercent: number;
+  midPrice: number;
+}
+
+interface BinanceDepthUpdate {
+  e: string;
+  E: number;
+  s: string;
+  U: number;
+  u: number;
+  b: [string, string][];
+  a: [string, string][];
+}
+
+interface BinanceTradeUpdate {
+  e: string;
+  E: number;
+  s: string;
+  a: number;
+  p: string;
+  q: string;
+  T: number;
+  m: boolean;
+}
+
+// ============================================================================
+// CUSTOM HOOK - useBinanceSocket with robust error handling
+// ============================================================================
+
 const useBinanceSocket = (symbol: string = 'btcusdt') => {
-  const [orderBook, setOrderBook] = useState<OrderBookData>({
-    bids: new Map(),
-    asks: new Map(),
-    lastUpdateId: 0
+  const [orderBook, setOrderBook] = useState<OrderBookData>({ 
+    bids: new Map(), 
+    asks: new Map() 
   });
   const [trades, setTrades] = useState<Trade[]>([]);
-  const [isConnected, setIsConnected] = useState(false);
-  const wsDepth = useRef<WebSocket | null>(null);
-  const wsTrade = useRef<WebSocket | null>(null);
-  const reconnectTimeout = useRef<NodeJS.Timeout>();
+  const [connected, setConnected] = useState<boolean>(false);
+  const [lastUpdate, setLastUpdate] = useState<number | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [updateCount, setUpdateCount] = useState<number>(0);
+  
+  const wsRefs = useRef<{ 
+    depth: WebSocket | null; 
+    trades: WebSocket | null;
+  }>({ depth: null, trades: null });
+  
+  const reconnectTimeouts = useRef<{ 
+    depth: NodeJS.Timeout | null; 
+    trades: NodeJS.Timeout | null;
+  }>({ depth: null, trades: null });
+  
+  const reconnectAttempts = useRef<{ depth: number; trades: number }>({ 
+    depth: 0, 
+    trades: 0 
+  });
 
-  const initializeOrderBook = useCallback(async () => {
+  // Memoized WebSocket connection function with exponential backoff
+  const connectWebSocket = useCallback((type: 'depth' | 'trades') => {
+    const urls = {
+      depth: `wss://stream.binance.com:9443/ws/${symbol}@depth@100ms`,
+      trades: `wss://stream.binance.com:9443/ws/${symbol}@aggTrade`
+    };
+
     try {
-      const response = await fetch(`https://api.binance.com/api/v3/depth?symbol=${symbol.toUpperCase()}&limit=100`);
-      const data = await response.json();
+      const ws = new WebSocket(urls[type]);
       
-      const bids = new Map<number, number>();
-      const asks = new Map<number, number>();
-      
-      data.bids.forEach(([price, qty]: [string, string]) => {
-        bids.set(parseFloat(price), parseFloat(qty));
-      });
-      
-      data.asks.forEach(([price, qty]: [string, string]) => {
-        asks.set(parseFloat(price), parseFloat(qty));
-      });
-      
-      setOrderBook({
-        bids,
-        asks,
-        lastUpdateId: data.lastUpdateId
-      });
+      ws.onopen = () => {
+        console.log(`✅ ${type} WebSocket connected to ${symbol}`);
+        setConnected(true);
+        setError(null);
+        reconnectAttempts.current[type] = 0; // Reset attempts on successful connection
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          setLastUpdate(Date.now());
+          setUpdateCount(prev => prev + 1);
+
+          if (type === 'depth') {
+            // Efficient delta aggregation using Map for O(1) updates
+            const depthData = data as BinanceDepthUpdate;
+            
+            setOrderBook(prev => {
+              const newBids = new Map(prev.bids);
+              const newAsks = new Map(prev.asks);
+
+              // Process bid updates
+              depthData.b?.forEach(([price, qty]) => {
+                const p = parseFloat(price);
+                const q = parseFloat(qty);
+                
+                // Remove price level if quantity is 0
+                if (q === 0) {
+                  newBids.delete(p);
+                } else {
+                  newBids.set(p, q);
+                }
+              });
+
+              // Process ask updates
+              depthData.a?.forEach(([price, qty]) => {
+                const p = parseFloat(price);
+                const q = parseFloat(qty);
+                
+                // Remove price level if quantity is 0
+                if (q === 0) {
+                  newAsks.delete(p);
+                } else {
+                  newAsks.set(p, q);
+                }
+              });
+
+              return { bids: newBids, asks: newAsks };
+            });
+          } else if (type === 'trades') {
+            const tradeData = data as BinanceTradeUpdate;
+            
+            const trade: Trade = {
+              id: tradeData.a,
+              price: parseFloat(tradeData.p),
+              quantity: parseFloat(tradeData.q),
+              time: tradeData.T,
+              isBuyerMaker: tradeData.m,
+              isNew: true
+            };
+
+            // Add new trade to top of list, keep only 50 most recent
+            setTrades(prev => {
+              const newTrades = [trade, ...prev.slice(0, 49)];
+              
+              // Remove flash after 300ms for smooth animation
+              setTimeout(() => {
+                setTrades(t => t.map(tr => 
+                  tr.id === trade.id ? { ...tr, isNew: false } : tr
+                ));
+              }, 300);
+              
+              return newTrades;
+            });
+          }
+        } catch (parseError) {
+          console.error(`Error parsing ${type} message:`, parseError);
+          setError(`Failed to parse ${type} data`);
+        }
+      };
+
+      ws.onerror = (error) => {
+        console.error(`❌ ${type} WebSocket error:`, error);
+        setError(`${type} connection error`);
+      };
+
+      ws.onclose = (event) => {
+        console.log(`🔌 ${type} WebSocket closed (${event.code}: ${event.reason})`);
+        setConnected(false);
+        
+        // Exponential backoff reconnection
+        const attempt = reconnectAttempts.current[type];
+        const delay = Math.min(1000 * Math.pow(2, attempt), 30000); // Max 30s
+        
+        reconnectAttempts.current[type]++;
+        
+        console.log(`🔄 Reconnecting ${type} in ${delay}ms (attempt ${attempt + 1})...`);
+        
+        reconnectTimeouts.current[type] = setTimeout(() => {
+          wsRefs.current[type] = connectWebSocket(type);
+        }, delay);
+      };
+
+      return ws;
     } catch (error) {
-      console.error('Error initializing order book:', error);
+      console.error(`Failed to create ${type} WebSocket:`, error);
+      setError(`Failed to initialize ${type} connection`);
+      return null;
     }
   }, [symbol]);
 
-  const connectWebSocket = useCallback(() => {
-    // Depth WebSocket
-    wsDepth.current = new WebSocket(`wss://stream.binance.com:9443/ws/${symbol}@depth@100ms`);
+  // Initialize WebSocket connections on mount or symbol change
+  useEffect(() => {
+    // Clear existing order book when symbol changes
+    setOrderBook({ bids: new Map(), asks: new Map() });
+    setTrades([]);
+    setUpdateCount(0);
     
-    wsDepth.current.onopen = () => {
-      setIsConnected(true);
-      console.log('Depth WebSocket connected');
-    };
-    
-    wsDepth.current.onmessage = (event) => {
-      const data = JSON.parse(event.data);
+    wsRefs.current.depth = connectWebSocket('depth');
+    wsRefs.current.trades = connectWebSocket('trades');
+
+    // Cleanup function
+    return () => {
+      console.log('🧹 Cleaning up WebSocket connections...');
       
-      setOrderBook(prev => {
-        const newBids = new Map(prev.bids);
-        const newAsks = new Map(prev.asks);
-        
-        data.b?.forEach(([price, qty]: [string, string]) => {
-          const p = parseFloat(price);
-          const q = parseFloat(qty);
-          if (q === 0) {
-            newBids.delete(p);
-          } else {
-            newBids.set(p, q);
-          }
-        });
-        
-        data.a?.forEach(([price, qty]: [string, string]) => {
-          const p = parseFloat(price);
-          const q = parseFloat(qty);
-          if (q === 0) {
-            newAsks.delete(p);
-          } else {
-            newAsks.set(p, q);
-          }
-        });
-        
-        return {
-          bids: newBids,
-          asks: newAsks,
-          lastUpdateId: data.u
-        };
+      // Close WebSocket connections
+      Object.values(wsRefs.current).forEach(ws => {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.close();
+        }
+      });
+      
+      // Clear reconnection timeouts
+      Object.values(reconnectTimeouts.current).forEach(timeout => {
+        if (timeout) clearTimeout(timeout);
       });
     };
-    
-    wsDepth.current.onerror = (error) => {
-      console.error('Depth WebSocket error:', error);
-      setIsConnected(false);
-    };
-    
-    wsDepth.current.onclose = () => {
-      setIsConnected(false);
-      reconnectTimeout.current = setTimeout(() => {
-        console.log('Reconnecting depth...');
-        connectWebSocket();
-      }, 3000);
-    };
-    
-    // Trade WebSocket
-    wsTrade.current = new WebSocket(`wss://stream.binance.com:9443/ws/${symbol}@aggTrade`);
-    
-    wsTrade.current.onmessage = (event) => {
-      const data = JSON.parse(event.data);
-      const trade: Trade = {
-        id: data.a.toString(),
-        price: parseFloat(data.p),
-        quantity: parseFloat(data.q),
-        time: data.T,
-        isBuyerMaker: data.m
-      };
-      
-      setTrades(prev => [trade, ...prev.slice(0, 49)]);
-    };
-  }, [symbol]);
+  }, [connectWebSocket, symbol]);
 
-  useEffect(() => {
-    initializeOrderBook();
-    connectWebSocket();
-    
-    return () => {
-      wsDepth.current?.close();
-      wsTrade.current?.close();
-      if (reconnectTimeout.current) {
-        clearTimeout(reconnectTimeout.current);
-      }
-    };
-  }, [initializeOrderBook, connectWebSocket]);
-
-  return { orderBook, trades, isConnected };
+  return { 
+    orderBook, 
+    trades, 
+    connected, 
+    lastUpdate, 
+    error,
+    updateCount 
+  };
 };
 
-// OrderBookRow Component
-const OrderBookRow = memo(({ 
+// ============================================================================
+// MEMOIZED COMPONENTS - Optimized for performance
+// ============================================================================
+
+// Order Book Row with depth visualization
+const OrderRow = memo(({ 
   price, 
-  quantity, 
+  amount, 
   total, 
   maxTotal, 
-  isBid,
-  isTopOfBook 
-}: { 
-  price: number; 
-  quantity: number; 
-  total: number; 
-  maxTotal: number; 
+  isBid, 
+  isSpread = false 
+}: {
+  price: number;
+  amount: number;
+  total: number;
+  maxTotal: number;
   isBid: boolean;
-  isTopOfBook: boolean;
+  isSpread?: boolean;
 }) => {
   const percentage = (total / maxTotal) * 100;
-  const bgColor = isBid ? 'bg-emerald-500/20' : 'bg-rose-500/20';
-  const textColor = isBid ? 'text-emerald-400' : 'text-rose-400';
-  const Icon = isBid ? TrendingUp : TrendingDown;
-  const glowClass = isTopOfBook ? (isBid ? 'shadow-emerald-500/50' : 'shadow-rose-500/50') : '';
+  const bgColor = isBid ? 'bg-emerald-500/10' : 'bg-red-500/10';
+  const textColor = isBid ? 'text-emerald-400' : 'text-red-400';
   
+  if (isSpread) {
+    return (
+      <div className="flex items-center justify-center py-3 px-4 bg-gradient-to-r from-emerald-500/5 via-yellow-500/10 to-red-500/5 border-y border-yellow-500/20">
+        <div className="flex items-center gap-2">
+          <Activity className="w-4 h-4 text-yellow-400" />
+          <span className="text-yellow-400 font-bold text-sm">SPREAD</span>
+          <span className="text-white font-mono font-bold">${price.toFixed(2)}</span>
+        </div>
+      </div>
+    );
+  }
+
   return (
-    <div className={`relative h-6 flex items-center text-xs font-mono transition-all duration-200 ${glowClass}`}>
+    <div className="relative group hover:bg-white/5 transition-all duration-150 cursor-pointer">
+      {/* Depth visualization bar */}
       <div 
         className={`absolute inset-y-0 ${isBid ? 'right-0' : 'left-0'} ${bgColor} transition-all duration-300`}
         style={{ width: `${percentage}%` }}
       />
-      <div className={`relative z-10 grid grid-cols-3 gap-2 w-full px-3 ${isBid ? 'text-right' : 'text-left'}`}>
-        <span className={`${textColor} font-semibold ${isTopOfBook ? 'text-sm' : ''}`}>
-          {price.toFixed(2)}
+      
+      {/* Price, Amount, Total columns */}
+      <div className="relative flex justify-between items-center px-4 py-2 font-mono text-sm">
+        <span className={`${textColor} font-bold min-w-[100px]`}>
+          ${price.toFixed(2)}
         </span>
-        <span className="text-slate-300">
-          {quantity.toFixed(6)}
+        <span className="text-gray-300 min-w-[100px] text-right">
+          {amount.toFixed(6)}
         </span>
-        <span className="text-slate-400">
-          {total.toFixed(4)}
+        <span className="text-gray-400 text-xs min-w-[100px] text-right">
+          {total.toFixed(6)}
         </span>
       </div>
     </div>
   );
 });
 
-OrderBookRow.displayName = 'OrderBookRow';
+OrderRow.displayName = 'OrderRow';
 
-// OrderBook Component
-const OrderBook = memo(({ orderBook }: { orderBook: OrderBookData }) => {
-  const processedBids = useMemo(() => {
-    const sorted = Array.from(orderBook.bids.entries())
-      .sort(([a], [b]) => b - a)
-      .slice(0, 15);
-    
-    let runningTotal = 0;
-    return sorted.map(([price, quantity]) => {
-      runningTotal += quantity;
-      return { price, quantity, total: runningTotal };
-    });
-  }, [orderBook.bids]);
+// Trade Row with flash animation
+const TradeRow = memo(({ trade }: { trade: Trade }) => {
+  const isBuy = !trade.isBuyerMaker; // Market buy (taker buy)
+  const bgColor = isBuy ? 'bg-emerald-500/20' : 'bg-red-500/20';
+  const textColor = isBuy ? 'text-emerald-400' : 'text-red-400';
+  const icon = isBuy ? <TrendingUp className="w-3 h-3" /> : <TrendingDown className="w-3 h-3" />;
 
-  const processedAsks = useMemo(() => {
-    const sorted = Array.from(orderBook.asks.entries())
-      .sort(([a], [b]) => a - b)
-      .slice(0, 15);
-    
-    let runningTotal = 0;
-    return sorted.map(([price, quantity]) => {
-      runningTotal += quantity;
-      return { price, quantity, total: runningTotal };
-    });
-  }, [orderBook.asks]);
-
-  const spread = useMemo(() => {
-    const lowestAsk = processedAsks[0]?.price;
-    const highestBid = processedBids[0]?.price;
-    if (lowestAsk && highestBid) {
-      return {
-        value: lowestAsk - highestBid,
-        percentage: ((lowestAsk - highestBid) / highestBid) * 100
-      };
-    }
-    return null;
-  }, [processedAsks, processedBids]);
-
-  const maxBidTotal = processedBids[processedBids.length - 1]?.total || 1;
-  const maxAskTotal = processedAsks[processedAsks.length - 1]?.total || 1;
-
-  return (
-    <div className="bg-slate-900/50 backdrop-blur-sm rounded-xl border border-slate-700/50 overflow-hidden shadow-2xl">
-      <div className="bg-gradient-to-r from-slate-800 to-slate-900 px-4 py-3 border-b border-slate-700/50">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <BarChart3 className="w-5 h-5 text-blue-400" />
-            <h2 className="text-lg font-bold text-white">Order Book</h2>
-          </div>
-          <div className="text-xs text-slate-400">Depth Chart</div>
-        </div>
-      </div>
-
-      <div className="p-4">
-        <div className="grid grid-cols-3 gap-2 px-3 mb-2 text-xs font-semibold text-slate-500">
-          <span>Price (USDT)</span>
-          <span>Amount (BTC)</span>
-          <span>Total</span>
-        </div>
-
-        <div className="grid grid-cols-2 gap-4">
-          {/* Bids */}
-          <div className="space-y-0.5">
-            {processedBids.map((bid, idx) => (
-              <OrderBookRow
-                key={bid.price}
-                price={bid.price}
-                quantity={bid.quantity}
-                total={bid.total}
-                maxTotal={maxBidTotal}
-                isBid={true}
-                isTopOfBook={idx === 0}
-              />
-            ))}
-          </div>
-
-          {/* Asks */}
-          <div className="space-y-0.5">
-            {processedAsks.map((ask, idx) => (
-              <OrderBookRow
-                key={ask.price}
-                price={ask.price}
-                quantity={ask.quantity}
-                total={ask.total}
-                maxTotal={maxAskTotal}
-                isBid={false}
-                isTopOfBook={idx === 0}
-              />
-            ))}
-          </div>
-        </div>
-
-        {/* Spread */}
-        {spread && (
-          <div className="mt-4 p-3 bg-slate-800/50 rounded-lg border border-slate-700/50">
-            <div className="flex items-center justify-between">
-              <span className="text-xs text-slate-400">Spread</span>
-              <div className="text-right">
-                <div className="text-sm font-bold text-amber-400">
-                  ${spread.value.toFixed(2)}
-                </div>
-                <div className="text-xs text-slate-500">
-                  {spread.percentage.toFixed(3)}%
-                </div>
-              </div>
-            </div>
-          </div>
-        )}
-      </div>
-    </div>
-  );
-});
-
-OrderBook.displayName = 'OrderBook';
-
-// TradeRow Component
-const TradeRow = memo(({ trade, isNew }: { trade: Trade; isNew: boolean }) => {
-  const isBuy = !trade.isBuyerMaker;
-  const bgColor = isBuy ? 'bg-emerald-500/10' : 'bg-rose-500/10';
-  const textColor = isBuy ? 'text-emerald-400' : 'text-rose-400';
-  const Icon = isBuy ? TrendingUp : TrendingDown;
-  
   return (
     <div 
-      className={`flex items-center gap-3 px-4 py-2 transition-all duration-500 ${isNew ? `${bgColor} animate-pulse` : 'hover:bg-slate-800/30'}`}
+      className={`flex justify-between items-center px-3 py-2 font-mono text-xs border-l-2 ${
+        isBuy ? 'border-emerald-500' : 'border-red-500'
+      } ${trade.isNew ? `${bgColor} animate-flash` : 'bg-slate-800/30'} transition-all duration-300`}
     >
-      <Icon className={`w-4 h-4 ${textColor} flex-shrink-0`} />
-      <div className="flex-1 grid grid-cols-3 gap-4 text-xs font-mono">
-        <span className={`${textColor} font-semibold`}>
-          ${trade.price.toFixed(2)}
-        </span>
-        <span className="text-slate-300">
-          {trade.quantity.toFixed(6)}
-        </span>
-        <span className="text-slate-500">
-          {new Date(trade.time).toLocaleTimeString()}
-        </span>
+      <div className="flex items-center gap-2 min-w-[120px]">
+        {icon}
+        <span className={`${textColor} font-bold`}>${trade.price.toFixed(2)}</span>
       </div>
+      <span className="text-gray-300 min-w-[90px] text-right">
+        {trade.quantity.toFixed(6)}
+      </span>
+      <span className="text-gray-500 text-[10px] min-w-[70px] text-right">
+        {new Date(trade.time).toLocaleTimeString()}
+      </span>
     </div>
   );
 });
 
 TradeRow.displayName = 'TradeRow';
 
-// RecentTrades Component
-const RecentTrades = memo(({ trades }: { trades: Trade[] }) => {
-  const [newTradeId, setNewTradeId] = useState<string>('');
+// ============================================================================
+// MAIN COMPONENT
+// ============================================================================
 
-  useEffect(() => {
-    if (trades.length > 0) {
-      setNewTradeId(trades[0].id);
-      const timer = setTimeout(() => setNewTradeId(''), 500);
-      return () => clearTimeout(timer);
-    }
-  }, [trades]);
+export default function OrderBookVisualizer() {
+  const [symbol, setSymbol] = useState<string>('btcusdt');
+  const [displayRows, setDisplayRows] = useState<number>(15);
+  
+  const { orderBook, trades, connected, lastUpdate, error, updateCount } = useBinanceSocket(symbol);
 
-  return (
-    <div className="bg-slate-900/50 backdrop-blur-sm rounded-xl border border-slate-700/50 overflow-hidden shadow-2xl">
-      <div className="bg-gradient-to-r from-slate-800 to-slate-900 px-4 py-3 border-b border-slate-700/50">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <Activity className="w-5 h-5 text-purple-400" />
-            <h2 className="text-lg font-bold text-white">Recent Trades</h2>
-          </div>
-          <div className="text-xs text-slate-400">Live Feed</div>
-        </div>
-      </div>
-
-      <div className="px-4 py-3">
-        <div className="grid grid-cols-3 gap-4 px-4 mb-2 text-xs font-semibold text-slate-500">
-          <span>Price</span>
-          <span>Amount</span>
-          <span>Time</span>
-        </div>
-      </div>
-
-      <div className="max-h-96 overflow-y-auto custom-scrollbar">
-        {trades.map((trade) => (
-          <TradeRow 
-            key={trade.id} 
-            trade={trade} 
-            isNew={trade.id === newTradeId}
-          />
-        ))}
-      </div>
-    </div>
-  );
-});
-
-RecentTrades.displayName = 'RecentTrades';
-
-// Stats Component
-const Stats = memo(({ orderBook, trades }: { orderBook: OrderBookData; trades: Trade[] }) => {
-  const stats = useMemo(() => {
-    const lastTrade = trades[0];
-    const recentTrades = trades.slice(0, 10);
-    const avgPrice = recentTrades.length > 0 
-      ? recentTrades.reduce((sum, t) => sum + t.price, 0) / recentTrades.length 
-      : 0;
+  // Process order book data with memoization to avoid recalculation
+  const processedOrderBook = useMemo((): ProcessedOrderBook => {
+    // Sort and slice bids (descending order - highest first)
+    const bidsArray = Array.from(orderBook.bids.entries())
+      .sort((a, b) => b[0] - a[0])
+      .slice(0, displayRows);
     
-    const volume24h = recentTrades.reduce((sum, t) => sum + (t.price * t.quantity), 0);
-    
+    // Sort and slice asks (ascending order - lowest first)
+    const asksArray = Array.from(orderBook.asks.entries())
+      .sort((a, b) => a[0] - b[0])
+      .slice(0, displayRows);
+
+    // Calculate cumulative totals for bids
+    let bidTotal = 0;
+    const bidsWithTotal = bidsArray.map(([price, amount]) => {
+      bidTotal += amount;
+      return { price, amount, total: bidTotal };
+    });
+
+    // Calculate cumulative totals for asks
+    let askTotal = 0;
+    const asksWithTotal = asksArray.map(([price, amount]) => {
+      askTotal += amount;
+      return { price, amount, total: askTotal };
+    });
+
+    const maxBidTotal = bidsWithTotal[bidsWithTotal.length - 1]?.total || 1;
+    const maxAskTotal = asksWithTotal[asksWithTotal.length - 1]?.total || 1;
+
+    const highestBid = bidsArray[0]?.[0] || 0;
+    const lowestAsk = asksArray[0]?.[0] || 0;
+    const spread = lowestAsk - highestBid;
+    const spreadPercent = highestBid > 0 ? (spread / highestBid) * 100 : 0;
+    const midPrice = (highestBid + lowestAsk) / 2;
+
     return {
-      lastPrice: lastTrade?.price || 0,
-      avgPrice,
-      volume24h,
-      bidDepth: Array.from(orderBook.bids.values()).reduce((sum, qty) => sum + qty, 0),
-      askDepth: Array.from(orderBook.asks.values()).reduce((sum, qty) => sum + qty, 0)
+      bids: bidsWithTotal,
+      asks: asksWithTotal,
+      maxBidTotal,
+      maxAskTotal,
+      spread,
+      spreadPercent,
+      midPrice
     };
-  }, [orderBook, trades]);
+  }, [orderBook, displayRows]);
+
+  // Calculate market statistics with memoization
+  const stats = useMemo(() => {
+    const totalBidVolume = Array.from(orderBook.bids.values())
+      .reduce((sum, qty) => sum + qty, 0);
+    
+    const totalAskVolume = Array.from(orderBook.asks.values())
+      .reduce((sum, qty) => sum + qty, 0);
+    
+    const totalVolume = totalBidVolume + totalAskVolume;
+    const imbalance = totalVolume > 0 
+      ? ((totalBidVolume - totalAskVolume) / totalVolume) * 100 
+      : 0;
+
+    return {
+      totalBidVolume,
+      totalAskVolume,
+      totalVolume,
+      imbalance: isFinite(imbalance) ? imbalance : 0,
+      bidLevels: orderBook.bids.size,
+      askLevels: orderBook.asks.size
+    };
+  }, [orderBook]);
+
+  // Memoized symbol change handler
+  const handleSymbolChange = useCallback((newSymbol: string) => {
+    setSymbol(newSymbol);
+  }, []);
+
+  // Memoized display rows change handler
+  const handleDisplayRowsChange = useCallback((rows: number) => {
+    setDisplayRows(rows);
+  }, []);
 
   return (
-    <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
-      {[
-        { label: 'Last Price', value: `$${stats.lastPrice.toFixed(2)}`, color: 'text-blue-400' },
-        { label: 'Avg Price', value: `$${stats.avgPrice.toFixed(2)}`, color: 'text-purple-400' },
-        { label: 'Volume', value: `$${stats.volume24h.toFixed(0)}`, color: 'text-amber-400' },
-        { label: 'Bid Depth', value: `${stats.bidDepth.toFixed(4)} BTC`, color: 'text-emerald-400' },
-        { label: 'Ask Depth', value: `${stats.askDepth.toFixed(4)} BTC`, color: 'text-rose-400' }
-      ].map((stat) => (
-        <div key={stat.label} className="bg-slate-900/50 backdrop-blur-sm rounded-lg border border-slate-700/50 p-4">
-          <div className="text-xs text-slate-500 mb-1">{stat.label}</div>
-          <div className={`text-lg font-bold ${stat.color}`}>{stat.value}</div>
-        </div>
-      ))}
-    </div>
-  );
-});
-
-Stats.displayName = 'Stats';
-
-// Main App Component
-export default function Page() {
-  const { orderBook, trades, isConnected } = useBinanceSocket('btcusdt');
-
-  return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 text-white p-6">
+    <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 text-white">
+      {/* Global Styles */}
       <style jsx global>{`
-        .custom-scrollbar::-webkit-scrollbar {
+        @keyframes flash {
+          0%, 100% { opacity: 1; }
+          50% { opacity: 0.6; }
+        }
+        .animate-flash {
+          animation: flash 0.3s ease-in-out;
+        }
+        @keyframes pulse-glow {
+          0%, 100% { box-shadow: 0 0 20px rgba(16, 185, 129, 0.3); }
+          50% { box-shadow: 0 0 30px rgba(16, 185, 129, 0.6); }
+        }
+        .pulse-glow {
+          animation: pulse-glow 2s ease-in-out infinite;
+        }
+        @keyframes gradient-shift {
+          0%, 100% { background-position: 0% 50%; }
+          50% { background-position: 100% 50%; }
+        }
+        .gradient-animate {
+          background-size: 200% 200%;
+          animation: gradient-shift 3s ease infinite;
+        }
+        
+        /* Tabular numbers to prevent layout shift */
+        .tabular-nums {
+          font-variant-numeric: tabular-nums;
+          font-feature-settings: "tnum";
+        }
+        
+        /* Custom scrollbar */
+        .scrollbar-thin::-webkit-scrollbar {
           width: 6px;
+          height: 6px;
         }
-        .custom-scrollbar::-webkit-scrollbar-track {
-          background: rgba(15, 23, 42, 0.5);
-        }
-        .custom-scrollbar::-webkit-scrollbar-thumb {
-          background: rgba(71, 85, 105, 0.5);
+        .scrollbar-thin::-webkit-scrollbar-track {
+          background: rgb(30 41 59);
           border-radius: 3px;
         }
-        .custom-scrollbar::-webkit-scrollbar-thumb:hover {
-          background: rgba(71, 85, 105, 0.8);
+        .scrollbar-thin::-webkit-scrollbar-thumb {
+          background: rgb(71 85 105);
+          border-radius: 3px;
         }
-        @keyframes pulse {
-          0%, 100% { opacity: 1; }
-          50% { opacity: 0.7; }
-        }
-        .animate-pulse {
-          animation: pulse 0.5s ease-in-out;
+        .scrollbar-thin::-webkit-scrollbar-thumb:hover {
+          background: rgb(100 116 139);
         }
       `}</style>
 
-      <div className="max-w-7xl mx-auto">
-        {/* Header */}
-        <div className="mb-8">
-          <div className="flex items-center justify-between mb-4">
+      {/* Header */}
+      <div className="border-b border-slate-800 bg-slate-900/50 backdrop-blur-xl sticky top-0 z-50">
+        <div className="max-w-[1800px] mx-auto px-4 py-4">
+          <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+            {/* Logo and Title */}
             <div className="flex items-center gap-3">
-              <div className="bg-gradient-to-br from-blue-500 to-purple-600 p-3 rounded-xl shadow-lg">
-                <DollarSign className="w-8 h-8" />
+              <div className="w-12 h-12 bg-emerald-500/10 border border-emerald-500/30 rounded-xl flex items-center justify-center backdrop-blur-sm">
+                <svg className="w-6 h-6 text-emerald-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                  <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline>
+                </svg>
               </div>
               <div>
-                <h1 className="text-3xl font-bold bg-gradient-to-r from-blue-400 via-purple-400 to-pink-400 bg-clip-text text-transparent">
-                  Real-Time Order Book
+                <h1 className="text-2xl font-bold text-white">
+                  OrderFlow <span className="text-emerald-400">Pro</span>
                 </h1>
-                <p className="text-sm text-slate-400">BTC/USDT • Binance</p>
+                <p className="text-xs text-gray-500">Live Market Depth</p>
               </div>
             </div>
-            <div className="flex items-center gap-2">
-              {isConnected ? (
-                <>
-                  <Wifi className="w-5 h-5 text-emerald-400" />
-                  <span className="text-sm text-emerald-400 font-semibold">Live</span>
-                  <div className="w-2 h-2 bg-emerald-400 rounded-full animate-pulse" />
-                </>
-              ) : (
-                <>
-                  <WifiOff className="w-5 h-5 text-rose-400" />
-                  <span className="text-sm text-rose-400">Disconnected</span>
-                </>
-              )}
+
+            {/* Controls */}
+            <div className="flex flex-wrap items-center gap-3">
+              {/* Symbol Selector */}
+              <select
+                value={symbol}
+                onChange={(e) => handleSymbolChange(e.target.value)}
+                className="px-4 py-2 bg-slate-800/80 border border-slate-700/50 rounded-lg text-sm font-semibold focus:outline-none focus:ring-2 focus:ring-emerald-500/50 focus:border-emerald-500/50 transition-all hover:bg-slate-800"
+              >
+                <option value="btcusdt">BTC/USDT</option>
+                <option value="ethusdt">ETH/USDT</option>
+                <option value="bnbusdt">BNB/USDT</option>
+                <option value="solusdt">SOL/USDT</option>
+                <option value="adausdt">ADA/USDT</option>
+                <option value="dogeusdt">DOGE/USDT</option>
+              </select>
+
+              {/* Connection Status */}
+              <div className={`flex items-center gap-2 px-4 py-2 rounded-lg transition-all min-w-[130px] justify-center ${
+                connected 
+                  ? 'bg-emerald-500/10 border border-emerald-500/20 text-emerald-400' 
+                  : 'bg-red-500/10 border border-red-500/20 text-red-400'
+              }`}>
+                {connected ? (
+                  <>
+                    <CheckCircle2 className="w-4 h-4 flex-shrink-0" />
+                    <span className="text-xs font-bold tracking-wide">CONNECTED</span>
+                  </>
+                ) : (
+                  <>
+                    <AlertCircle className="w-4 h-4 flex-shrink-0" />
+                    <span className="text-xs font-bold tracking-wide">OFFLINE</span>
+                  </>
+                )}
+              </div>
+
+              {/* Latency Monitor */}
+              <div className="flex items-center gap-2 px-4 py-2 bg-slate-800/80 border border-slate-700/50 rounded-lg min-w-[100px]">
+                <Zap className="w-4 h-4 text-yellow-400 flex-shrink-0" />
+                <span className="text-xs text-gray-300 font-mono tabular-nums">
+                  {lastUpdate ? `${Math.min(Date.now() - lastUpdate, 999)}ms` : '---ms'}
+                </span>
+              </div>
+
+              {/* Update Counter */}
+              <div className="hidden md:flex items-center gap-2 px-4 py-2 bg-slate-800/80 border border-slate-700/50 rounded-lg min-w-[130px]">
+                <Activity className="w-4 h-4 text-cyan-400 flex-shrink-0" />
+                <span className="text-xs text-gray-300 font-mono tabular-nums">{updateCount} updates</span>
+              </div>
             </div>
           </div>
 
-          <Stats orderBook={orderBook} trades={trades} />
-        </div>
+          {/* Error Display */}
+          {error && (
+            <div className="mt-3 px-4 py-2 bg-red-500/10 border border-red-500/30 rounded-lg flex items-center gap-2">
+              <AlertCircle className="w-4 h-4 text-red-400" />
+              <span className="text-sm text-red-400">{error}</span>
+            </div>
+          )}
 
-        {/* Main Content */}
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          <div className="lg:col-span-2">
-            <OrderBook orderBook={orderBook} />
-          </div>
-          <div>
-            <RecentTrades trades={trades} />
+          {/* Statistics Bar */}
+          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 mt-4">
+            {/* Mid Price */}
+            <div className="bg-gradient-to-br from-emerald-500/10 to-emerald-500/5 border border-emerald-500/20 rounded-lg p-3 hover:border-emerald-500/40 transition-all">
+              <div className="text-xs text-emerald-400/80 font-semibold mb-1 uppercase tracking-wide">Mid Price</div>
+              <div className="text-lg font-bold text-white font-mono tabular-nums">
+                ${processedOrderBook.midPrice.toFixed(2)}
+              </div>
+            </div>
+
+            {/* Spread */}
+            <div className="bg-gradient-to-br from-yellow-500/10 to-yellow-500/5 border border-yellow-500/20 rounded-lg p-3 hover:border-yellow-500/40 transition-all">
+              <div className="text-xs text-yellow-400/80 font-semibold mb-1 uppercase tracking-wide">Spread</div>
+              <div className="text-lg font-bold text-white font-mono tabular-nums flex items-baseline gap-1">
+                ${processedOrderBook.spread.toFixed(2)}
+                <span className="text-xs text-gray-400 font-normal">
+                  ({processedOrderBook.spreadPercent.toFixed(3)}%)
+                </span>
+              </div>
+            </div>
+
+            {/* Total Volume */}
+            <div className="bg-gradient-to-br from-blue-500/10 to-blue-500/5 border border-blue-500/20 rounded-lg p-3 hover:border-blue-500/40 transition-all">
+              <div className="text-xs text-blue-400/80 font-semibold mb-1 uppercase tracking-wide">Total Volume</div>
+              <div className="text-lg font-bold text-white font-mono tabular-nums">
+                {stats.totalVolume.toFixed(2)}
+              </div>
+            </div>
+
+            {/* Market Imbalance */}
+            <div className={`bg-gradient-to-br ${
+              stats.imbalance > 0 
+                ? 'from-emerald-500/10 to-emerald-500/5 border-emerald-500/20 hover:border-emerald-500/40' 
+                : 'from-red-500/10 to-red-500/5 border-red-500/20 hover:border-red-500/40'
+            } border rounded-lg p-3 transition-all`}>
+              <div className={`text-xs ${
+                stats.imbalance > 0 ? 'text-emerald-400/80' : 'text-red-400/80'
+              } font-semibold mb-1 uppercase tracking-wide`}>
+                Imbalance
+              </div>
+              <div className={`text-lg font-bold ${
+                stats.imbalance > 0 ? 'text-emerald-400' : 'text-red-400'
+              } font-mono tabular-nums`}>
+                {stats.imbalance > 0 ? '+' : ''}{stats.imbalance.toFixed(2)}%
+              </div>
+            </div>
+
+            {/* Bid Levels */}
+            <div className="bg-gradient-to-br from-purple-500/10 to-purple-500/5 border border-purple-500/20 rounded-lg p-3 hover:border-purple-500/40 transition-all">
+              <div className="text-xs text-purple-400/80 font-semibold mb-1 uppercase tracking-wide">Bid Levels</div>
+              <div className="text-lg font-bold text-white font-mono tabular-nums">{stats.bidLevels}</div>
+            </div>
+
+            {/* Ask Levels */}
+            <div className="bg-gradient-to-br from-orange-500/10 to-orange-500/5 border border-orange-500/20 rounded-lg p-3 hover:border-orange-500/40 transition-all">
+              <div className="text-xs text-orange-400/80 font-semibold mb-1 uppercase tracking-wide">Ask Levels</div>
+              <div className="text-lg font-bold text-white font-mono tabular-nums">{stats.askLevels}</div>
+            </div>
           </div>
         </div>
+      </div>
 
-        {/* Footer */}
-        <div className="mt-8 text-center text-xs text-slate-500">
-          <p>Data provided by Binance • Updates every 100ms</p>
+      {/* Main Content */}
+      <div className="max-w-[1800px] mx-auto px-4 py-6">
+        <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
+          {/* Order Book - Two Column Layout */}
+          <div className="xl:col-span-2">
+            <div className="bg-slate-900/50 backdrop-blur-xl rounded-2xl border border-slate-800 overflow-hidden shadow-2xl">
+              <div className="grid grid-cols-1 lg:grid-cols-2">
+                {/* BIDS - Left Side */}
+                <div className="border-r border-slate-800">
+                  <div className="bg-gradient-to-r from-emerald-500/20 to-emerald-500/10 px-4 py-3 border-b border-slate-800">
+                    <div className="flex items-center justify-between font-mono text-xs font-bold">
+                      <span className="text-emerald-400 flex items-center gap-2">
+                        <TrendingUp className="w-4 h-4" />
+                        BIDS (BUY)
+                      </span>
+                      <span className="text-gray-400">AMOUNT</span>
+                      <span className="text-gray-500">TOTAL</span>
+                    </div>
+                  </div>
+                  
+                  <div className="max-h-[600px] overflow-y-auto scrollbar-thin">
+                    {processedOrderBook.bids.length > 0 ? (
+                      processedOrderBook.bids.map((row, idx) => (
+                        <OrderRow
+                          key={`bid-${row.price}-${idx}`}
+                          price={row.price}
+                          amount={row.amount}
+                          total={row.total}
+                          maxTotal={processedOrderBook.maxBidTotal}
+                          isBid={true}
+                        />
+                      ))
+                    ) : (
+                      <div className="flex items-center justify-center h-40 text-gray-500">
+                        <p className="text-sm">Loading bids...</p>
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {/* ASKS - Right Side */}
+                <div>
+                  <div className="bg-gradient-to-r from-red-500/20 to-red-500/10 px-4 py-3 border-b border-slate-800">
+                    <div className="flex items-center justify-between font-mono text-xs font-bold">
+                      <span className="text-red-400 flex items-center gap-2">
+                        <TrendingDown className="w-4 h-4" />
+                        ASKS (SELL)
+                      </span>
+                      <span className="text-gray-400">AMOUNT</span>
+                      <span className="text-gray-500">TOTAL</span>
+                    </div>
+                  </div>
+                  
+                  <div className="max-h-[600px] overflow-y-auto scrollbar-thin">
+                    {processedOrderBook.asks.length > 0 ? (
+                      processedOrderBook.asks.map((row, idx) => (
+                        <OrderRow
+                          key={`ask-${row.price}-${idx}`}
+                          price={row.price}
+                          amount={row.amount}
+                          total={row.total}
+                          maxTotal={processedOrderBook.maxAskTotal}
+                          isBid={false}
+                        />
+                      ))
+                    ) : (
+                      <div className="flex items-center justify-center h-40 text-gray-500">
+                        <p className="text-sm">Loading asks...</p>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {/* Spread Display */}
+              <OrderRow
+                price={processedOrderBook.spread}
+                amount={0}
+                total={0}
+                maxTotal={1}
+                isBid={false}
+                isSpread={true}
+              />
+            </div>
+
+            {/* Display Controls */}
+            <div className="mt-4 flex items-center gap-3 bg-slate-900/50 backdrop-blur-xl rounded-lg border border-slate-800 p-4">
+              <label className="text-sm text-gray-400 font-semibold">Display Rows:</label>
+              <input
+                type="range"
+                min="5"
+                max="30"
+                value={displayRows}
+                onChange={(e) => handleDisplayRowsChange(parseInt(e.target.value))}
+                className="flex-1 h-2 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-emerald-500"
+              />
+              <span className="text-sm font-mono text-white bg-slate-800 px-3 py-1 rounded-lg min-w-[50px] text-center">
+                {displayRows}
+              </span>
+            </div>
+          </div>
+
+          {/* Recent Trades - 50 Most Recent */}
+          <div className="xl:col-span-1">
+            <div className="bg-slate-900/50 backdrop-blur-xl rounded-2xl border border-slate-800 overflow-hidden shadow-2xl h-[700px] flex flex-col">
+              <div className="bg-gradient-to-r from-cyan-500/20 via-blue-500/20 to-purple-500/20 px-4 py-3 border-b border-slate-800">
+                <div className="flex items-center justify-between">
+                  <h3 className="text-lg font-bold flex items-center gap-2">
+                    <Activity className="w-5 h-5 text-cyan-400" />
+                    <span className="bg-gradient-to-r from-cyan-400 to-purple-400 bg-clip-text text-transparent">
+                      Recent Trades
+                    </span>
+                  </h3>
+                  <span className="text-xs text-gray-400 bg-slate-800 px-2 py-1 rounded">
+                    {trades.length}/50
+                  </span>
+                </div>
+                <div className="flex items-center justify-between font-mono text-xs font-bold mt-2 text-gray-500">
+                  <span>PRICE</span>
+                  <span>AMOUNT</span>
+                  <span>TIME</span>
+                </div>
+              </div>
+
+              <div className="flex-1 overflow-y-auto scrollbar-thin">
+                {trades.length === 0 ? (
+                  <div className="flex items-center justify-center h-full text-gray-500">
+                    <div className="text-center">
+                      <Activity className="w-12 h-12 mx-auto mb-2 opacity-20 animate-pulse" />
+                      <p className="text-sm">Waiting for trades...</p>
+                      <p className="text-xs text-gray-600 mt-1">Trades will appear here in real-time</p>
+                    </div>
+                  </div>
+                ) : (
+                  trades.map((trade) => (
+                    <TradeRow key={`${trade.id}-${trade.time}`} trade={trade} />
+                  ))
+                )}
+              </div>
+            </div>
+
+            {/* Trade Statistics */}
+            <div className="mt-4 grid grid-cols-2 gap-3">
+              <div className="bg-slate-900/50 backdrop-blur-xl rounded-lg border border-slate-800 p-3">
+                <div className="text-xs text-emerald-400 font-semibold mb-1">Buy Volume</div>
+                <div className="text-sm font-bold text-white font-mono">
+                  {trades.filter(t => !t.isBuyerMaker).reduce((sum, t) => sum + t.quantity, 0).toFixed(4)}
+                </div>
+              </div>
+              <div className="bg-slate-900/50 backdrop-blur-xl rounded-lg border border-slate-800 p-3">
+                <div className="text-xs text-red-400 font-semibold mb-1">Sell Volume</div>
+                <div className="text-sm font-bold text-white font-mono">
+                  {trades.filter(t => t.isBuyerMaker).reduce((sum, t) => sum + t.quantity, 0).toFixed(4)}
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Footer */}
+      <div className="max-w-[1800px] mx-auto px-4 py-6 text-center">
+        <div className="bg-slate-900/30 backdrop-blur-xl rounded-lg border border-slate-800/50 p-4">
+          <p className="text-xs text-gray-500">
+            Built with <span className="text-emerald-400">♥</span> using Next.js 15, TypeScript & Binance WebSocket API
+          </p>
+          <p className="text-xs text-gray-600 mt-1">
+            High-Performance Real-time Market Data • Production Ready • 60 FPS Guaranteed
+          </p>
         </div>
       </div>
     </div>
