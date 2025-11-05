@@ -17,6 +17,9 @@ import {
   Minus,
   Plus,
   SlidersHorizontal,
+  Pause,
+  Play,
+  Eye,
 } from 'lucide-react';
 
 // ============================================================================
@@ -24,68 +27,61 @@ import {
 // ============================================================================
 type StrNumTuple = [string, string];
 
-interface OrderBookLevel {
-  price: number;
-  amount: number;
-  total: number;
-}
-
+interface OrderBookLevel { price: number; amount: number; total: number; }
+interface BestLevel { price: number; amount: number; }
 interface ProcessedOrderBook {
-  bids: OrderBookLevel[];
-  asks: OrderBookLevel[];
-  maxBidTotal: number;
-  maxAskTotal: number;
-  spread: number;
-  spreadPercent: number;
-  midPrice: number;
+  bids: OrderBookLevel[]; asks: OrderBookLevel[];
+  maxBidTotal: number; maxAskTotal: number;
+  spread: number; spreadPercent: number; midPrice: number;
+  bestBid?: BestLevel; bestAsk?: BestLevel;
 }
-
-interface Trade {
-  id: number;
-  price: number;
-  quantity: number;
-  time: number;
-  isBuyerMaker: boolean;
-  isNew: boolean;
-}
-
-interface BinanceDepthUpdate {
-  e: string; E: number; s: string; U: number; u: number;
-  b: StrNumTuple[]; a: StrNumTuple[];
-}
-
-interface BinanceTradeUpdate {
-  e: string; E: number; s: string; a: number; p: string; q: string; T: number; m: boolean;
-}
-
-interface BookTickerUpdate { u: number; s: string; b: string; B: string; a: string; A: string; }
+interface Trade { id: number; price: number; quantity: number; time: number; isBuyerMaker: boolean; isNew: boolean; }
+interface BinanceDepthUpdate { e:string; E:number; s:string; U:number; u:number; b:StrNumTuple[]; a:StrNumTuple[]; }
+interface BinanceTradeUpdate { e:string; E:number; s:string; a:number; p:string; q:string; T:number; m:boolean; }
+interface BookTickerUpdate { u:number; s:string; b:string; B:string; a:string; A:string; }
 
 // ============================================================================
-// Utils
+// Format helpers
 // ============================================================================
+const nfCache = new Map<number, Intl.NumberFormat>();
+function fmtFixed(n: number, dp: number): string {
+  if (!isFinite(n)) return '0';
+  let nf = nfCache.get(dp);
+  if (!nf) {
+    nf = new Intl.NumberFormat(undefined, { minimumFractionDigits: dp, maximumFractionDigits: dp });
+    nfCache.set(dp, nf);
+  }
+  return nf.format(n);
+}
+function fmtCompact(n: number): string {
+  if (!isFinite(n)) return '0';
+  const abs = Math.abs(n);
+  if (abs >= 1e9) return (n / 1e9).toFixed(2) + 'B';
+  if (abs >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+  if (abs >= 1e3) return (n / 1e3).toFixed(2) + 'K';
+  return n.toFixed(2);
+}
 function decimalsFromStep(step: string): number {
   if (!step.includes('.')) return 0;
   const trimmed = step.replace(/0+$/, '');
   const i = trimmed.indexOf('.');
   return i >= 0 ? (trimmed.length - i - 1) : 0;
 }
-function toFixed(n: number, dp: number): string {
-  if (!isFinite(n)) return '0';
-  return n.toFixed(dp);
-}
 
 // ============================================================================
-// Rows
+// Rows (memoized)
 // ============================================================================
 const OrderRow = memo(function OrderRow({
-  price, amount, total, maxTotal, isBid, isSpread = false, priceFmt, qtyFmt,
+  price, amount, total, maxTotal, isBid, isSpread = false, priceFmt, qtyFmt, dense,
 }: {
   price: number; amount: number; total: number; maxTotal: number; isBid: boolean; isSpread?: boolean;
-  priceFmt: (n: number) => string; qtyFmt: (n: number) => string;
+  priceFmt: (n:number)=>string; qtyFmt:(n:number)=>string; dense:boolean;
 }) {
   const pct = maxTotal > 0 ? (total / maxTotal) * 100 : 0;
   const bgColor = isBid ? 'bg-emerald-500/10' : 'bg-red-500/10';
   const textColor = isBid ? 'text-emerald-400' : 'text-red-400';
+  const py = dense ? 'py-1.5' : 'py-2.5';
+  const text = dense ? 'text-[11px] sm:text-xs' : 'text-[12px] sm:text-sm';
 
   if (isSpread) {
     return (
@@ -100,12 +96,9 @@ const OrderRow = memo(function OrderRow({
   }
 
   return (
-    <div className="relative group hover:bg-white/5 transition-all duration-150">
-      <div
-        className={`absolute inset-y-0 ${isBid ? 'right-0' : 'left-0'} ${bgColor}`}
-        style={{ width: `${Math.min(100, Math.max(0, pct))}%` }}
-      />
-      <div className="relative flex justify-between items-center px-3 sm:px-4 py-2 font-mono text-[11px] sm:text-sm">
+    <div className="relative group hover:bg-white/5 transition-colors">
+      <div className={`absolute inset-y-0 ${isBid ? 'right-0' : 'left-0'} ${bgColor}`} style={{ width: `${Math.min(100, Math.max(0, pct))}%` }} />
+      <div className={`relative flex justify-between items-center px-3 sm:px-4 ${py} font-mono ${text}`}>
         <span className={`${textColor} font-bold min-w-[90px] sm:min-w-[120px]`}>${priceFmt(price)}</span>
         <span className="text-gray-300 min-w-[80px] sm:min-w-[100px] text-right">{qtyFmt(amount)}</span>
         <span className="text-gray-400 text-[10px] sm:text-xs min-w-[80px] sm:min-w-[100px] text-right">{qtyFmt(total)}</span>
@@ -123,7 +116,7 @@ const TradeRow = memo(function TradeRow({ trade, priceFmt, qtyFmt }:{
   const icon = isBuy ? <TrendingUp className="w-3 h-3" /> : <TrendingDown className="w-3 h-3" />;
 
   return (
-    <div className={`flex justify-between items-center px-3 py-2 font-mono text-[11px] sm:text-xs border-l-2 ${isBuy ? 'border-emerald-500' : 'border-red-500'} ${trade.isNew ? `${bgColor} animate-flash` : 'bg-slate-800/30'} transition-all`}>
+    <div className={`flex justify-between items-center px-3 py-2 font-mono text-[11px] sm:text-xs border-l-2 ${isBuy ? 'border-emerald-500' : 'border-red-500'} ${trade.isNew ? `${bgColor} animate-flash` : 'bg-slate-800/30'} transition-colors`}>
       <div className="flex items-center gap-2 min-w-[110px] sm:min-w-[120px]">
         {icon}
         <span className={`${textColor} font-bold`}>${priceFmt(trade.price)}</span>
@@ -138,11 +131,20 @@ const TradeRow = memo(function TradeRow({ trade, priceFmt, qtyFmt }:{
 // Page
 // ============================================================================
 export default function Page() {
-  // symbol + rows
+  // core controls
   const [symbol, setSymbol] = useState<string>('btcusdt');
   const [displayRows, _setDisplayRows] = useState<number>(20);
   const setDisplayRows = useCallback((n:number) => _setDisplayRows(Math.max(5, Math.min(100, Math.floor(n)))), []);
-  const rowsRef = useRef<number>(20); // keeps latest rows for flush
+  const rowsRef = useRef<number>(20);
+
+  const [groupMult, setGroupMult] = useState<number>(1);            // ×ticks
+  const groupMultRef = useRef<number>(1);
+  const tickSizeRef = useRef<number>(0.01);
+
+  const [paused, setPaused] = useState(false);
+  const pausedRef = useRef(false);
+
+  const [dense, setDense] = useState<boolean>(false);
 
   // connection state
   const [connected, setConnected] = useState<boolean>(false);
@@ -154,7 +156,7 @@ export default function Page() {
   const [priceDp, setPriceDp] = useState<number>(2);
   const [qtyDp, setQtyDp] = useState<number>(6);
 
-  // processed view + trades
+  // processed + trades
   const [processed, setProcessed] = useState<ProcessedOrderBook>({
     bids: [], asks: [], maxBidTotal: 1, maxAskTotal: 1, spread: 0, spreadPercent: 0, midPrice: 0,
   });
@@ -165,7 +167,7 @@ export default function Page() {
   const [reconnects, setReconnects] = useState<number>(0);
   const [buffered, setBuffered] = useState<number>(0);
 
-  // refs
+  // refs for book + sockets
   const bidsRef = useRef<Map<string, number>>(new Map());
   const asksRef = useRef<Map<string, number>>(new Map());
   const lastUpdateIdRef = useRef<number>(0);
@@ -181,85 +183,98 @@ export default function Page() {
   const reconnectTimers = useRef<{ depth: ReturnType<typeof setTimeout> | null; trades: ReturnType<typeof setTimeout> | null; ticker: ReturnType<typeof setTimeout> | null; }>({ depth: null, trades: null, ticker: null });
 
   // formatters
-  const priceFmt = useCallback((n: number) => toFixed(n, priceDp), [priceDp]);
-  const qtyFmt = useCallback((n: number) => toFixed(n, qtyDp), [qtyDp]);
+  const priceFmt = useCallback((n: number) => fmtFixed(n, priceDp), [priceDp]);
+  const qtyFmt   = useCallback((n: number) => fmtFixed(n, qtyDp),   [qtyDp]);
 
-  // rAF batching
+  // msgs/sec
+  useEffect(() => { const id = setInterval(() => { setMps(msgCounterRef.current); msgCounterRef.current = 0; }, 1000); return () => clearInterval(id); }, []);
+
+  // keep refs in sync
+  useEffect(() => { rowsRef.current = displayRows; queueFlush(); }, [displayRows]);
+  useEffect(() => { groupMultRef.current = groupMult; queueFlush(); }, [groupMult]);
+  useEffect(() => { pausedRef.current = paused; }, [paused]);
+
+  // ----- helpers -----
+  const bucketize = (price: number, step: number, side: 'bid'|'ask') => {
+    if (step <= 0 || !isFinite(step)) return price;
+    const inv = 1 / step;
+    const idx = side === 'bid' ? Math.floor(price * inv) : Math.ceil(price * inv);
+    return idx / inv;
+  };
+
+  // ----- rAF batched view computation -----
   const flushView = useCallback(() => {
     rafIdRef.current = 0;
+    if (pausedRef.current) return;
+
     const be = Array.from(bidsRef.current.entries());
     const ae = Array.from(asksRef.current.entries());
 
     if (be.length === 0 || ae.length === 0) {
-      setProcessed({ bids: [], asks: [], maxBidTotal: 1, maxAskTotal: 1, spread: 0, spreadPercent: 0, midPrice: 0 });
+      setProcessed({ bids: [], asks: [], maxBidTotal: 1, maxAskTotal: 1, spread: 0, spreadPercent: 0, midPrice: 0, bestBid: undefined, bestAsk: undefined });
       return;
     }
 
-    const bestBid = Math.max(...be.map(([p]) => parseFloat(p)));
-    const bestAsk = Math.min(...ae.map(([p]) => parseFloat(p)));
-    let spread = bestAsk - bestBid;
+    const bestBidRaw = Math.max(...be.map(([p]) => parseFloat(p)));
+    const bestAskRaw = Math.min(...ae.map(([p]) => parseFloat(p)));
+    let spread = bestAskRaw - bestBidRaw;
 
     if (!isFinite(spread) || spread <= 0) {
       const { bid, ask } = bestTickerRef.current;
       if (ask > bid && isFinite(ask - bid)) {
-        spread = ask - bid;
-        const mid = (ask + bid) / 2;
-        const sPct = mid > 0 ? (spread / mid) * 100 : 0;
-        setProcessed({ bids: [], asks: [], maxBidTotal: 1, maxAskTotal: 1, spread, spreadPercent: sPct, midPrice: mid });
+        const midT = (ask + bid) / 2;
+        const sprT = ask - bid;
+        setProcessed({ bids: [], asks: [], maxBidTotal: 1, maxAskTotal: 1, spread: sprT, spreadPercent: midT > 0 ? (sprT/midT)*100 : 0, midPrice: midT, bestBid: {price: bid, amount: 0}, bestAsk: {price: ask, amount: 0} });
         return;
       }
-      setProcessed({ bids: [], asks: [], maxBidTotal: 1, maxAskTotal: 1, spread: 0, spreadPercent: 0, midPrice: 0 });
+      setProcessed({ bids: [], asks: [], maxBidTotal: 1, maxAskTotal: 1, spread: 0, spreadPercent: 0, midPrice: 0, bestBid: undefined, bestAsk: undefined });
       return;
     }
 
-    const mid = (bestAsk + bestBid) / 2;
+    const mid = (bestAskRaw + bestBidRaw) / 2;
     const sPct = mid > 0 ? (spread / mid) * 100 : 0;
     if (!isFinite(sPct) || sPct > 10) {
-      setProcessed({ bids: [], asks: [], maxBidTotal: 1, maxAskTotal: 1, spread: 0, spreadPercent: 0, midPrice: 0 });
+      setProcessed({ bids: [], asks: [], maxBidTotal: 1, maxAskTotal: 1, spread: 0, spreadPercent: 0, midPrice: 0, bestBid: undefined, bestAsk: undefined });
       return;
     }
 
-    // window + slice using latest rows count from ref
-    const windowPx = 1_000_000;
-    const rows = rowsRef.current;
+    const tick = tickSizeRef.current || Math.pow(10, -priceDp);
+    const step = Math.max(tick * groupMultRef.current, tick);
 
-    const bidsSlice = be
-      .filter(([p]) => parseFloat(p) >= bestBid - windowPx)
-      .sort((a,b) => parseFloat(b[0]) - parseFloat(a[0]))
-      .slice(0, rows);
+    const gBids = new Map<number, number>();
+    const gAsks = new Map<number, number>();
+    for (const [ps, q] of be) {
+      const p = parseFloat(ps);
+      const b = bucketize(p, step, 'bid');
+      gBids.set(b, (gBids.get(b) ?? 0) + q);
+    }
+    for (const [ps, q] of ae) {
+      const p = parseFloat(ps);
+      const b = bucketize(p, step, 'ask');
+      gAsks.set(b, (gAsks.get(b) ?? 0) + q);
+    }
 
-    const asksSlice = ae
-      .filter(([p]) => parseFloat(p) <= bestAsk + windowPx)
-      .sort((a,b) => parseFloat(a[0]) - parseFloat(b[0]))
-      .slice(0, rows);
+    const bidsArr = Array.from(gBids.entries()).sort((a,b)=> b[0]-a[0]).slice(0, rowsRef.current);
+    const asksArr = Array.from(gAsks.entries()).sort((a,b)=> a[0]-b[0]).slice(0, rowsRef.current);
 
     let bt = 0;
-    const bids = bidsSlice.map(([p,q]) => { const price = parseFloat(p); const amount = q; bt += amount; return { price, amount, total: bt }; });
+    const bids = bidsArr.map(([p,q]) => { bt += q; return { price:p, amount:q, total:bt }; });
     let at = 0;
-    const asks = asksSlice.map(([p,q]) => { const price = parseFloat(p); const amount = q; at += amount; return { price, amount, total: at }; });
+    const asks = asksArr.map(([p,q]) => { at += q; return { price:p, amount:q, total:at }; });
 
     setProcessed({
       bids, asks,
-      maxBidTotal: bids[bids.length - 1]?.total ?? 1,
-      maxAskTotal: asks[asks.length - 1]?.total ?? 1,
+      maxBidTotal: bids[bids.length-1]?.total ?? 1,
+      maxAskTotal: asks[asks.length-1]?.total ?? 1,
       spread, spreadPercent: sPct, midPrice: mid,
+      bestBid: bids.length ? { price: bids[0].price, amount: gBids.get(bids[0].price) ?? bids[0].amount } : undefined,
+      bestAsk: asks.length ? { price: asks[0].price, amount: gAsks.get(asks[0].price) ?? asks[0].amount } : undefined,
     });
-  }, []);
+  }, [priceDp]);
+
   const queueFlush = useCallback(() => { if (!rafIdRef.current) rafIdRef.current = requestAnimationFrame(flushView); }, [flushView]);
 
-  // make slider immediate: keep ref in sync and flush
-  useEffect(() => {
-    rowsRef.current = displayRows;
-    queueFlush();
-  }, [displayRows, queueFlush]);
-
-  // msgs/sec
-  useEffect(() => {
-    const id = setInterval(() => { setMps(msgCounterRef.current); msgCounterRef.current = 0; }, 1000);
-    return () => clearInterval(id);
-  }, []);
-
-  // precision
+  // precision from REST
   const loadPrecision = useCallback(async (sym: string) => {
     try {
       const r = await fetch('https://api.binance.com/api/v3/exchangeInfo?symbol=' + sym.toUpperCase());
@@ -267,9 +282,10 @@ export default function Page() {
       const filt = j.symbols?.[0]?.filters || [];
       const priceFilter = filt.find((f: any) => f.filterType === 'PRICE_FILTER');
       const lotFilter = filt.find((f: any) => f.filterType === 'LOT_SIZE');
+      tickSizeRef.current = parseFloat(priceFilter?.tickSize ?? '0.01');
       setPriceDp(Math.min(8, Math.max(0, decimalsFromStep(priceFilter?.tickSize ?? '0.01'))));
       setQtyDp(Math.min(8, Math.max(0, decimalsFromStep(lotFilter?.stepSize ?? '0.000001'))));
-    } catch { setPriceDp(2); setQtyDp(6); }
+    } catch { tickSizeRef.current = 0.01; setPriceDp(2); setQtyDp(6); }
   }, []);
 
   // snapshot
@@ -306,7 +322,7 @@ export default function Page() {
     }
   }, [queueFlush]);
 
-  // depth apply
+  // apply depth deltas
   const applyDepth = useCallback((ev: BinanceDepthUpdate, sym: string) => {
     if (!readyRef.current) { bufferRef.current.push(ev); setBuffered(bufferRef.current.length); return; }
     if (ev.u <= lastUpdateIdRef.current) return;
@@ -321,7 +337,6 @@ export default function Page() {
 
   // sockets
   const openSockets = useCallback((sym: string, session: number) => {
-    // depth
     try {
       const ws = new WebSocket(`wss://stream.binance.com:9443/ws/${sym}@depth@100ms`);
       wsDepthRef.current = ws;
@@ -340,7 +355,6 @@ export default function Page() {
       };
     } catch { setError('failed to open depth socket'); }
 
-    // trades
     try {
       const ws = new WebSocket(`wss://stream.binance.com:9443/ws/${sym}@aggTrade`);
       wsTradesRef.current = ws;
@@ -364,7 +378,6 @@ export default function Page() {
       };
     } catch { setError('failed to open trades socket'); }
 
-    // bookTicker
     try {
       const ws = new WebSocket(`wss://stream.binance.com:9443/ws/${sym}@bookTicker`);
       wsTickerRef.current = ws;
@@ -395,7 +408,7 @@ export default function Page() {
     reconnectTimers.current = { depth: null, trades: null, ticker: null };
   }, []);
 
-  // symbol switch
+  // symbol switch lifecycle
   useEffect(() => {
     closeSockets(); sessionRef.current += 1; const s = sessionRef.current;
     setConnected(false); setError(null); setUpdateCount(0); setLastUpdate(null); setTrades([]);
@@ -410,9 +423,19 @@ export default function Page() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [symbol]);
 
-  // ========================================================================
-  // UI
-  // ========================================================================
+  // derived for headers
+  const totalBidVol = Array.from(bidsRef.current.values()).reduce((s,q)=>s+q,0);
+  const totalAskVol = Array.from(asksRef.current.values()).reduce((s,q)=>s+q,0);
+  const totalVol = totalBidVol + totalAskVol;
+  const dominance = totalVol > 0 ? (totalBidVol / totalVol) : 0;
+
+  // 1-minute trade imbalance for quick judgment
+  const now = Date.now();
+  const lastMin = trades.filter(t => now - t.time <= 60_000);
+  const buy1m = lastMin.filter(t=>!t.isBuyerMaker).reduce((s,t)=>s+t.quantity,0);
+  const sell1m = lastMin.filter(t=> t.isBuyerMaker).reduce((s,t)=>s+t.quantity,0);
+  const im1m = (buy1m + sell1m) > 0 ? ((buy1m - sell1m)/(buy1m + sell1m))*100 : 0;
+
   return (
     <div className="min-h-screen bg-slate-950 text-white pb-[env(safe-area-inset-bottom)]">
       <style jsx global>{`
@@ -427,7 +450,7 @@ export default function Page() {
       `}</style>
 
       {/* Header */}
-      <div className="border-b border-slate-800 bg-slate-900/50 backdrop-blur-xl sticky top-0 z-50">
+      <div className="border-b border-slate-800 bg-slate-900/60 backdrop-blur-xl sticky top-0 z-50">
         <div className="max-w-[1800px] mx-auto px-3 sm:px-4 py-3 sm:py-4">
           <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3 sm:gap-4">
             <div className="flex items-center gap-3">
@@ -457,6 +480,28 @@ export default function Page() {
                 <option value="dogeusdt">DOGE/USDT</option>
               </select>
 
+              <button
+                onClick={() => setPaused(p => !p)}
+                className={`px-3 py-2 rounded-lg text-xs sm:text-sm border ${paused ? 'border-yellow-500/40 bg-yellow-500/10 text-yellow-300' : 'border-slate-700/50 bg-slate-800/80 text-gray-200'}`}
+                title={paused ? 'Resume' : 'Pause live updates'}
+              >
+                <span className="inline-flex items-center gap-2">
+                  {paused ? <Play className="w-4 h-4" /> : <Pause className="w-4 h-4" />}
+                  {paused ? 'Resume' : 'Pause'}
+                </span>
+              </button>
+
+              <button
+                onClick={() => setDense(d => !d)}
+                className="px-3 py-2 rounded-lg text-xs sm:text-sm border border-slate-700/50 bg-slate-800/80 text-gray-200"
+                title="Toggle density"
+              >
+                <span className="inline-flex items-center gap-2">
+                  <Eye className="w-4 h-4" />
+                  {dense ? 'Comfort' : 'Compact'}
+                </span>
+              </button>
+
               <div className={`flex items-center gap-2 px-3 sm:px-4 py-2 rounded-lg min-w-[110px] sm:min-w-[130px] justify-center ${connected ? 'bg-emerald-500/10 border border-emerald-500/20 text-emerald-400' : 'bg-red-500/10 border border-red-500/20 text-red-400'}`}>
                 {connected ? <CheckCircle2 className="w-4 h-4" /> : <AlertCircle className="w-4 h-4" />}
                 <span className="text-[10px] sm:text-xs font-bold">{connected ? 'CONNECTED' : 'OFFLINE'}</span>
@@ -468,54 +513,56 @@ export default function Page() {
                   {lastUpdate ? `${Math.min(Date.now() - lastUpdate, 999)}ms` : '---ms'}
                 </span>
               </div>
-
-              <div className="hidden md:flex items-center gap-2 px-4 py-2 bg-slate-800/80 border border-slate-700/50 rounded-lg min-w-[130px]">
-                <Activity className="w-4 h-4 text-cyan-400" />
-                <span className="text-xs text-gray-300 font-mono tabular-nums">{updateCount} updates</span>
-              </div>
             </div>
           </div>
 
-          {/* Metrics row */}
-          <div className="grid grid-cols-3 sm:grid-cols-6 lg:grid-cols-8 gap-2 sm:gap-3 mt-3">
+          {/* Top-of-book strip for instant judgment */}
+          <div className="mt-3 grid grid-cols-1 sm:grid-cols-3 gap-2 sm:gap-3">
+            <BestCard
+              title="Best Bid"
+              price={processed.bestBid?.price ?? bestTickerRef.current.bid}
+              size={processed.bestBid?.amount ?? 0}
+              color="emerald"
+              priceFmt={priceFmt}
+              qtyFmt={qtyFmt}
+            />
+            <BestCard
+              title="Best Ask"
+              price={processed.bestAsk?.price ?? bestTickerRef.current.ask}
+              size={processed.bestAsk?.amount ?? 0}
+              color="red"
+              priceFmt={priceFmt}
+              qtyFmt={qtyFmt}
+            />
+            <div className="bg-gradient-to-br from-yellow-500/10 to-yellow-500/5 border border-yellow-500/20 rounded-lg p-3">
+              <div className="text-[10px] sm:text-xs text-yellow-300/90 font-semibold uppercase mb-1">Spread / Mid</div>
+              <div className="text-xl sm:text-2xl font-bold font-mono tabular-nums">
+                ${priceFmt(processed.spread)} <span className="text-sm sm:text-lg text-gray-400">({fmtFixed(processed.spreadPercent,3)}%)</span>
+              </div>
+              <div className="text-[11px] sm:text-xs text-gray-400 mt-1">Mid ${priceFmt(processed.midPrice)}</div>
+            </div>
+          </div>
+
+          {/* Quick metrics */}
+          <div className="grid grid-cols-3 sm:grid-cols-6 gap-2 sm:gap-3 mt-3">
             <InfoBox label="Msgs/sec" value={mps} />
             <InfoBox label="Reconnects" value={reconnects} />
             <InfoBox label="Buffered" value={buffered} />
-            <InfoBox label="Session" value={sessionRef.current} />
-            <InfoBox label="Price dp" value={priceDp} />
-            <InfoBox label="Qty dp" value={qtyDp} />
-            <div className="col-span-3 sm:col-span-2 bg-slate-900/60 border border-slate-800 rounded-lg p-2 sm:p-3">
-              <div className="text-[9px] sm:text-[10px] text-gray-400 uppercase">Best Ticker</div>
-              <div className="text-xs sm:text-sm font-mono">
-                Bid ${priceFmt(bestTickerRef.current.bid)} • Ask ${priceFmt(bestTickerRef.current.ask)}
-              </div>
-            </div>
+            <InfoBox label="Group" value={`×${groupMult} • ~${priceFmt((tickSizeRef.current || 0.01) * groupMult)}`} />
+            <InfoBox label="1m Imbalance" value={`${fmtFixed(im1m,1)}%`} />
+            <InfoBox label="Rows" value={rowsRef.current} />
           </div>
 
-          {/* Stat tiles */}
-          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2 sm:gap-3 mt-3">
-            <Tile title="Mid Price" body={`$${priceFmt(processed.midPrice)}`} tone="emerald" />
-            <Tile title="Spread" body={`$${priceFmt(processed.spread)}  (${toFixed(processed.spreadPercent, 3)}%)`} tone="yellow" />
-            <Tile
-              title="Total Volume"
-              body={qtyFmt(
-                Array.from(bidsRef.current.values()).reduce((s,q)=>s+q,0) +
-                Array.from(asksRef.current.values()).reduce((s,q)=>s+q,0)
-              )}
-              tone="blue"
-            />
-            <Tile title="Bid Levels" body={`${bidsRef.current.size}`} tone="purple" />
-            <Tile title="Ask Levels" body={`${asksRef.current.size}`} tone="orange" />
-            <Tile
-              title="Imbalance"
-              body={(() => {
-                const b = Array.from(bidsRef.current.values()).reduce((s,q)=>s+q,0);
-                const a = Array.from(asksRef.current.values()).reduce((s,q)=>s+q,0);
-                const t = b+a; const im = t>0 ? ((b-a)/t)*100 : 0; const sign = im>0?'+':'';
-                return `${sign}${toFixed(im,2)}%`;
-              })()}
-              tone="slate"
-            />
+          {/* Dominance bar */}
+          <div className="mt-3 bg-slate-900/70 border border-slate-800 rounded-lg p-3">
+            <div className="flex items-center justify-between text-[10px] sm:text-xs font-mono mb-2">
+              <span className="text-emerald-400">Bid: {fmtCompact(totalBidVol)}</span>
+              <span className="text-gray-400">Total: {fmtCompact(totalVol)}</span>
+              <span className="text-red-400">Ask: {fmtCompact(totalAskVol)}</span>
+            </div>
+            <div className="h-2 rounded bg-slate-800 overflow-hidden">
+              <div className="h-full bg-emerald-600" style={{ width: `${dominance*100}%` }} />
+            </div>
           </div>
         </div>
       </div>
@@ -533,7 +580,7 @@ export default function Page() {
                   <div className="max-h-[52vh] md:max-h-[600px] overflow-y-auto scrollbar-thin touch-scroll">
                     {processed.bids.length > 0 ? processed.bids.map((row, i) => (
                       <OrderRow key={`bid-${row.price}-${i}`} price={row.price} amount={row.amount} total={row.total}
-                        maxTotal={processed.maxBidTotal} isBid priceFmt={priceFmt} qtyFmt={qtyFmt} />
+                        maxTotal={processed.maxBidTotal} isBid priceFmt={priceFmt} qtyFmt={qtyFmt} dense={dense} />
                     )) : <EmptyLoad color="emerald" text="Loading bids..." />}
                   </div>
                 </div>
@@ -544,75 +591,59 @@ export default function Page() {
                   <div className="max-h-[52vh] md:max-h-[600px] overflow-y-auto scrollbar-thin touch-scroll">
                     {processed.asks.length > 0 ? processed.asks.map((row, i) => (
                       <OrderRow key={`ask-${row.price}-${i}`} price={row.price} amount={row.amount} total={row.total}
-                        maxTotal={processed.maxAskTotal} isBid={false} priceFmt={priceFmt} qtyFmt={qtyFmt} />
+                        maxTotal={processed.maxAskTotal} isBid={false} priceFmt={priceFmt} qtyFmt={qtyFmt} dense={dense} />
                     )) : <EmptyLoad color="red" text="Loading asks..." />}
                   </div>
                 </div>
               </div>
 
               {/* Spread bar */}
-              <OrderRow price={processed.spread} amount={0} total={0} maxTotal={1} isBid={false} isSpread priceFmt={priceFmt} qtyFmt={qtyFmt} />
+              <OrderRow price={processed.spread} amount={0} total={0} maxTotal={1} isBid={false} isSpread priceFmt={priceFmt} qtyFmt={qtyFmt} dense={dense} />
             </div>
 
-            {/* Display Rows — mobile friendly */}
+            {/* Display + Group controls */}
             <div className="mt-3 sm:mt-4 bg-slate-900/50 rounded-lg border border-slate-800 p-3 sm:p-4">
               <div className="flex items-center gap-2 sm:gap-3">
                 <SlidersHorizontal className="w-4 h-4 text-emerald-400" />
                 <span className="text-xs sm:text-sm text-gray-300 font-semibold">Display rows</span>
               </div>
 
-              <div className="mt-2 sm:mt-3 flex flex-col gap-2">
-                {/* Stepper + number input */}
+              <div className="mt-2 sm:mt-3 flex flex-col gap-3">
                 <div className="flex items-center gap-2">
-                  <button
-                    onClick={() => setDisplayRows(displayRows - 1)}
-                    className="p-2 rounded-md bg-slate-800 border border-slate-700 active:scale-95"
-                    aria-label="decrease rows"
-                  >
+                  <button onClick={() => setDisplayRows(displayRows - 1)} className="p-2 rounded-md bg-slate-800 border border-slate-700 active:scale-95" aria-label="decrease rows">
                     <Minus className="w-4 h-4" />
                   </button>
 
                   <input
-                    type="number"
-                    min={5}
-                    max={100}
-                    step={1}
-                    value={displayRows}
+                    type="number" min={5} max={100} step={1} value={displayRows}
                     onChange={(e) => setDisplayRows(Number(e.target.value))}
                     className="w-20 text-center font-mono text-sm bg-slate-800 border border-slate-700 rounded-md py-2"
                   />
 
-                  <button
-                    onClick={() => setDisplayRows(displayRows + 1)}
-                    className="p-2 rounded-md bg-slate-800 border border-slate-700 active:scale-95"
-                    aria-label="increase rows"
-                  >
+                  <button onClick={() => setDisplayRows(displayRows + 1)} className="p-2 rounded-md bg-slate-800 border border-slate-700 active:scale-95" aria-label="increase rows">
                     <Plus className="w-4 h-4" />
                   </button>
 
-                  {/* Desktop slider */}
                   <input
-                    type="range"
-                    min={5}
-                    max={100}
-                    step={1}
-                    value={displayRows}
+                    type="range" min={5} max={100} step={1} value={displayRows}
                     onChange={(e) => setDisplayRows(Number(e.target.value))}
                     className="hidden sm:block flex-1 h-2 bg-slate-800 rounded-lg accent-emerald-500"
                   />
                 </div>
 
-                {/* Mobile quick presets */}
-                <div className="flex sm:hidden flex-wrap gap-2">
-                  {[10, 15, 20, 25, 30, 40, 60, 80].map(v => (
+                {/* Grouping */}
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-xs text-gray-400">Group by</span>
+                  {[1,5,10,50].map(m => (
                     <button
-                      key={v}
-                      onClick={() => setDisplayRows(v)}
-                      className={`px-3 py-1.5 rounded-md border text-xs font-semibold ${displayRows===v ? 'bg-emerald-600/20 border-emerald-500 text-emerald-300' : 'bg-slate-800 border-slate-700 text-gray-300'}`}
+                      key={m}
+                      onClick={() => setGroupMult(m)}
+                      className={`px-3 py-1.5 rounded-md border text-xs font-semibold ${groupMult===m ? 'bg-emerald-600/20 border-emerald-500 text-emerald-300' : 'bg-slate-800 border-slate-700 text-gray-300'}`}
                     >
-                      {v}
+                      ×{m} ticks
                     </button>
                   ))}
+                  <span className="text-[11px] text-gray-500 font-mono ml-1">~ {priceFmt((tickSizeRef.current||0.01)*groupMult)} per level</span>
                 </div>
               </div>
             </div>
@@ -625,9 +656,7 @@ export default function Page() {
                 <div className="flex items-center justify-between">
                   <h3 className="text-base sm:text-lg font-bold flex items-center gap-2">
                     <Activity className="w-4 h-4 sm:w-5 sm:h-5 text-cyan-400" />
-                    <span className="bg-gradient-to-r from-cyan-400 to-purple-400 bg-clip-text text-transparent">
-                      Recent Trades
-                    </span>
+                    <span className="bg-gradient-to-r from-cyan-400 to-purple-400 bg-clip-text text-transparent">Recent Trades</span>
                   </h3>
                   <span className="text-[10px] sm:text-xs text-gray-400 bg-slate-800 px-2 py-1 rounded">{trades.length}/50</span>
                 </div>
@@ -645,10 +674,8 @@ export default function Page() {
 
             {/* Trade sums */}
             <div className="mt-3 grid grid-cols-2 gap-2 sm:gap-3">
-              <MiniStat title="Buy Volume" tone="emerald"
-                value={qtyFmt(trades.filter(t=>!t.isBuyerMaker).reduce((s,t)=>s+t.quantity,0))} />
-              <MiniStat title="Sell Volume" tone="red"
-                value={qtyFmt(trades.filter(t=> t.isBuyerMaker).reduce((s,t)=>s+t.quantity,0))} />
+              <MiniStat title="Buy Volume" tone="emerald" value={fmtCompact(trades.filter(t=>!t.isBuyerMaker).reduce((s,t)=>s+t.quantity,0))} />
+              <MiniStat title="Sell Volume" tone="red"     value={fmtCompact(trades.filter(t=> t.isBuyerMaker).reduce((s,t)=>s+t.quantity,0))} />
             </div>
           </div>
         </div>
@@ -658,7 +685,7 @@ export default function Page() {
       <div className="max-w-[1800px] mx-auto px-3 sm:px-4 py-5 text-center">
         <div className="bg-slate-900/30 rounded-lg border border-slate-800/50 p-3 sm:p-4">
           <p className="text-[10px] sm:text-xs text-gray-500">
-            Next.js 15 • TypeScript • Binance snapshot+diff • rAF-batched updates • Mobile-optimized panes
+            Snapshot+delta sync • rAF-batched renders • Price grouping • Pause to inspect • Compact/Comfort modes
           </p>
         </div>
       </div>
@@ -667,7 +694,7 @@ export default function Page() {
 }
 
 // ============================================================================
-// Small UI helpers
+// UI helpers
 // ============================================================================
 function InfoBox({ label, value }:{label:string; value:number|string}) {
   return (
@@ -677,29 +704,30 @@ function InfoBox({ label, value }:{label:string; value:number|string}) {
     </div>
   );
 }
-function Tile({ title, body, tone }:{title:string; body:string; tone:'emerald'|'yellow'|'blue'|'purple'|'orange'|'slate'}) {
-  const map:any = {
-    emerald: 'from-emerald-500/10 to-emerald-500/5 border-emerald-500/20',
-    yellow:  'from-yellow-500/10 to-yellow-500/5 border-yellow-500/20',
-    blue:    'from-blue-500/10 to-blue-500/5 border-blue-500/20',
-    purple:  'from-purple-500/10 to-purple-500/5 border-purple-500/20',
-    orange:  'from-orange-500/10 to-orange-500/5 border-orange-500/20',
-    slate:   'from-slate-700/10 to-slate-700/5 border-slate-700/20',
-  };
+
+function BestCard({
+  title, price, size, color, priceFmt, qtyFmt,
+}:{
+  title:string; price:number; size:number; color:'emerald'|'red'; priceFmt:(n:number)=>string; qtyFmt:(n:number)=>string;
+}) {
+  const cls = color==='emerald' ? 'from-emerald-500/10 to-emerald-500/5 border-emerald-500/20' : 'from-red-500/10 to-red-500/5 border-red-500/20';
+  const text = color==='emerald' ? 'text-emerald-300' : 'text-red-300';
+  const icon = color==='emerald' ? <TrendingUp className="w-4 h-4" /> : <TrendingDown className="w-4 h-4" />;
+
   return (
-    <div className={`bg-gradient-to-br ${map[tone]} rounded-lg p-2 sm:p-3 border`}>
-      <div className="text-[10px] sm:text-xs text-white/70 font-semibold mb-1 uppercase">{title}</div>
-      <div className="text-sm sm:text-lg font-bold text-white font-mono tabular-nums">{body}</div>
+    <div className={`bg-gradient-to-br ${cls} rounded-lg p-3 border`}>
+      <div className="text-[10px] sm:text-xs text-white/70 font-semibold uppercase mb-1 flex items-center gap-2">{icon}{title}</div>
+      <div className="text-xl sm:text-2xl font-bold font-mono tabular-nums">${priceFmt(price || 0)}</div>
+      <div className={`text-[11px] sm:text-xs ${text} mt-1`}>Size {qtyFmt(size || 0)}</div>
     </div>
   );
 }
+
 function SectionHeader({ title, icon, color }:{title:string; icon:React.ReactNode; color:'emerald'|'red'}) {
-  const cls = color==='emerald'
-    ? 'from-emerald-500/20 to-emerald-500/10'
-    : 'from-red-500/20 to-red-500/10';
+  const cls = color==='emerald' ? 'from-emerald-500/20 to-emerald-500/10' : 'from-red-500/20 to-red-500/10';
   const text = color==='emerald' ? 'text-emerald-400' : 'text-red-400';
   return (
-    <div className={`bg-gradient-to-r ${cls} px-3 sm:px-4 py-3 border-b border-slate-800`}>
+    <div className={`bg-gradient-to-r ${cls} px-3 sm:px-4 py-3 border-b border-slate-800 sticky top-0 z-10`}>
       <div className="flex items-center justify-between font-mono text-[10px] sm:text-xs font-bold">
         <span className={`${text} flex items-center gap-2`}>{icon}{title}</span>
         <span className="text-gray-400">AMOUNT</span>
